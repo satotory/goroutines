@@ -4,112 +4,151 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
-	"io/ioutil"
+	"io/fs"
 	"log"
 	"os"
+	"time"
+
+	"github.com/nfnt/resize"
 )
 
-type Iob struct {
-	Path       string
-	ImageName  string
-	osFile     *os.File
-	decoded    image.Image
-	resIm      image.Image
-	pathToSave string
-	saveTo     *os.File
+const (
+	FOLDER    = "./images/"
+	RESFOLDER = "./resized_images/"
+)
+
+const (
+	ERR_READDIR       = "Read dir error"
+	ERR_OPENINGFILE   = "os Opening file error"
+	ERR_DECODINGFILE  = "png Decoding file error"
+	ERR_CREATING_FILE = "os Create file error"
+	ERR_ENCODING_PIC  = "png Encode pic error"
+)
+
+// chanels
+var (
+	firstCh   = make(chan imgs)
+	secondCh  = make(chan img)
+	thirdCh   = make(chan img)
+	fourthCh  = make(chan img)
+	endCh     = make(chan img)
+	endMainCh = make(chan string)
+)
+
+type img struct {
+	file      fs.DirEntry
+	index     int64
+	openedImg *os.File
+	saveFile  *os.File
+	decoImg   image.Image
+	resImg    image.Image
+	finished  bool
 }
 
-var opfch, decch, encch, resch = make(chan Iob), make(chan Iob), make(chan Iob), make(chan Iob)
-var quit, sizze, closed = make(chan int, 1), make(chan int, 1), make(chan int, 1)
+type imgs struct {
+	Files []fs.DirEntry
+	count int64
+}
+
+// files handler
+func selectCases() {
+	var (
+		lenFs    = int64(-1)
+		counterF int64
+	)
+
+	for {
+		if lenFs == counterF {
+			endMainCh <- "end of main goroutine"
+			break
+		}
+
+		select {
+		case imgs := <-firstCh:
+			lenFs = imgs.count
+			for i, file := range imgs.Files {
+				img := img{file: file, index: int64(i)}
+				go img.openingGorou()
+			}
+		case f := <-secondCh:
+			go f.decodingImgGorou()
+		case f := <-thirdCh:
+			go f.createFileToSave()
+		case f := <-fourthCh:
+			go f.resizeAndEncodeImg()
+		case f := <-endCh:
+			f.finished = true
+			counterF++
+			fmt.Println(f.file.Name(), f.index, counterF)
+		}
+	}
+}
+
+func (f img) openingGorou() {
+	var err error
+
+	f.openedImg, err = os.Open(FOLDER + f.file.Name())
+	if err != nil {
+		log.Println(ERR_OPENINGFILE)
+		log.Fatal(err)
+	}
+
+	secondCh <- f
+}
+
+func (f img) decodingImgGorou() {
+	var err error
+
+	f.decoImg, err = jpeg.Decode(f.openedImg)
+	if err != nil {
+		log.Println(ERR_DECODINGFILE)
+		log.Fatal(err)
+	}
+	f.openedImg.Close()
+
+	thirdCh <- f
+}
+
+func (f img) createFileToSave() {
+	var err error
+
+	f.saveFile, err = os.Create(RESFOLDER + f.file.Name())
+	if err != nil {
+		log.Println(ERR_CREATING_FILE)
+		log.Fatal(err)
+	}
+
+	fourthCh <- f
+}
+
+func (f img) resizeAndEncodeImg() {
+	defer f.saveFile.Close()
+	f.resImg = resize.Thumbnail(300, 200, f.decoImg, resize.Lanczos3)
+
+	err := jpeg.Encode(f.saveFile, f.resImg, nil)
+	if err != nil {
+		log.Println()
+		log.Fatal(err)
+	}
+	endCh <- f
+}
+
+func run() {
+	start := time.Now()
+	go selectCases()
+
+	fs, err := os.ReadDir(FOLDER)
+	if err != nil {
+		log.Println(ERR_READDIR)
+		log.Fatal(err)
+	}
+
+	firstCh <- imgs{Files: fs, count: int64(len(fs))}
+
+	elapsed := time.Since(start)
+	log.Printf("\nExecution time %s\n%s", elapsed, <-endMainCh)
+}
 
 func main() {
-	fmt.Println("Start")
-	f := "./image/"
-	go func() {
-		for o := range opfch {
-			go ope(o)
-		}
-	}()
-	go func() {
-		for o := range encch {
-			go resIm(o)
-			select {
-			case op := <-resch:
-				fmt.Printf("LAST STAGE WITH %s\n", op.pathToSave)
-			}
-		}
-		quit <- 0
-	}()
-	sel()
-	getFiles(f)
-
-	fmt.Println("End")
-}
-
-func sel() {
-	for i := 0; i < <-sizze; i++ {
-		select {
-		case opF := <-decch:
-			go decIm(opF)
-		case p := <-encch:
-			go resIm(p)
-		case op := <-resch:
-			fmt.Printf("LAST STAGE WITH %s\n", op.pathToSave)
-		}
-	}
-}
-
-func decIm(opF Iob) {
-	fmt.Printf("FILE opened - %s\n", opF.ImageName)
-	var err error
-	opF.decoded, err = jpeg.Decode(opF.osFile)
-	if err != nil {
-		log.Print(err)
-	}
-	encch <- opF
-}
-
-func resIm(o Iob) {
-	fmt.Printf("resizing - %s\n", o.ImageName)
-	resch <- o
-}
-
-func encodeJp(o Iob) {
-	fmt.Printf("%s in encodeJp\n", o.ImageName)
-	// var err error
-	// o.saveTo, err = os.Create(o.pathToSave)
-	// if err != nil {
-	// 	log.Print(err)
-	// }
-	// o.saveTo.Close()
-
-	// o.resIm, err = resize.Thumbnail(300, 200, o.decoded, resize.Lanczos3)
-}
-
-func ope(o Iob) {
-	var err error
-	o.osFile, err = os.Open(o.Path)
-	if err != nil {
-		log.Print(err)
-	}
-	decch <- o
-}
-
-func getFiles(fold string) {
-	files, err := ioutil.ReadDir(fold)
-	if err != nil {
-		log.Print(err)
-	}
-	fmt.Printf("SIZE - %d\n", len(files))
-	sizze <- len(files)
-	for i, f := range files {
-		select {
-		case opfch <- Iob{Path: fold + f.Name(), ImageName: f.Name(), pathToSave: "./resized/" + f.Name()}:
-			fmt.Printf("+INDEX - %d %s\n", i, fold+f.Name())
-		case <-quit:
-			fmt.Print("quit\n")
-			return
-		}
-	}
-
+	run()
 }
